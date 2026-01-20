@@ -183,7 +183,10 @@ ckmsgq_t *create_ckmsgq(ckpool_t *ckp, const char *name, const void *func)
 {
 	ckmsgq_t *ckmsgq = ckzalloc(sizeof(ckmsgq_t));
 
-	strncpy(ckmsgq->name, name, 15);
+	//strncpy(ckmsgq->name, name, 15);
+	strncpy(ckmsgq->name, name, sizeof(ckmsgq->name) - 1);
+	ckmsgq->name[sizeof(ckmsgq->name) - 1] = '\0';
+
 	ckmsgq->func = func;
 	ckmsgq->ckp = ckp;
 	ckmsgq->lock = ckalloc(sizeof(mutex_t));
@@ -208,7 +211,8 @@ ckmsgq_t *create_ckmsgqs(ckpool_t *ckp, const char *name, const void *func, cons
 	cond_init(cond);
 
 	for (i = 0; i < count; i++) {
-		snprintf(ckmsgq[i].name, 15, "%.6s%x", name, i);
+		//snprintf(ckmsgq[i].name, 15, "%.6s%x", name, i);
+		snprintf(ckmsgq[i].name, sizeof(ckmsgq[i].name), "%.6s%x", name, i & 0xff);
 		ckmsgq[i].func = func;
 		ckmsgq[i].ckp = ckp;
 		ckmsgq[i].lock = lock;
@@ -1842,10 +1846,11 @@ int main(int argc, char **argv)
 		if (send_recv_path(path, "ping")) {
 			for (i = 0; i < ckp.serverurls; i++) {
 				char oldurl[INET6_ADDRSTRLEN], oldport[8];
-				char getfd[16];
+				char getfd[20];
 				int sockd;
 
-				snprintf(getfd, 15, "getxfd%d", i);
+				//snprintf(getfd, 15, "getxfd%d", i);
+				snprintf(getfd, sizeof(getfd), "getxfd%d", i);
 				sockd = open_unix_client(path);
 				if (sockd < 1)
 					break;
