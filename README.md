@@ -1,12 +1,15 @@
 # CKPool - Next-Gen Mining Stratum Server
 **High-performance Bitcoin mining stratum server** featuring:
 
+✓ **Dual-Protocol Support: TLS 1.3 (port 3443) & Plaintext (port 3333)
+✓ **Encryption**: TLS_AES_256_GCM_SHA384 - 256-bit cipher suite
+✓ **Certificate Flexibility (Self-signed, CA-signed, Let's Encrypt and Client certificate verification)
 ✓ **Upgraded Hardware-Accelerated SHA-256** (SHA-NI + OpenSSL EVP)  
 ✓ **Modern build system** with CMake integration  
-✓ **Using latest/stable JSON/Jansson v2.14.1 library**  
+✓ **Using latest/stable JSON/Jansson v2.14.1 library
 ✓ **Optimized multi-process architecture** for Linux
 
-*"The most efficient CKPool implementation to date"*
+*"The most efficient and Secured CKPool implementation to date"*
 
 ## Prerequisites
 
@@ -27,18 +30,24 @@ cd ~
 git clone https://github.com/Mecanix-live/ckpool.git
 sudo chown -R $USER:$USER ckpool
 cd ckpool
-cmake -B build && cmake --build build --parallel
+cmake -B build -DGENERATE_SELF_SIGNED=ON && cmake --build build --parallel
 sudo cmake --install build
 ckpool --help
 ```
 
 ## Configuration
 
+### Certificates & CA Generation:
+```bash
+cd ~/ckpool
+./scripts/tls-setup.sh --self-signed
+./scripts/tls-setup.sh --ca
+```
+
 ### Create configuration file:
 ```bash
 nano ~/ckpool/ckpool.conf
 ```
-
 ### Example configuration (`ckpool.conf`):
 ```json
 {
@@ -50,8 +59,17 @@ nano ~/ckpool/ckpool.conf
     }
   ],
   "serverurl": [
-    "192.168.10.100:3333"
+    "192.168.10.10:3333",
+    "192.168.10.10:3443"
   ],
+  "plaintext_enabled": true,
+  "plaintext_port": 3333,
+  "tls_enabled": true,
+  "tls_port": 3443,
+  "tls_cert": "/home/mecanix/ckpool/certs/server.crt",
+  "tls_key": "/home/mecanix/ckpool/certs/server.key",
+  "tls_ca": "/home/mecanix/ckpool/certs/ca.crt",
+  "tls_verify": true,
   "btcaddress": "your_btc_address",
   "btcsig": "/mined by nobody/",
   "blockpoll": 100,
@@ -69,7 +87,7 @@ nano ~/ckpool/ckpool.conf
 
 > **Important:** Replace all placeholder values with your actual configuration:
 > - `your_rpcuser` and `your_rpcpassword` with your Bitcoin Core RPC credentials
-> - `192.168.10.100:3333` with your own server IP address and port number
+> - `192.168.10.10:3333` with your own server IP address and port number
 > - `your_btc_address` with your mining payout address
 > - `/home/mecanix/` with your actual home directory path
 

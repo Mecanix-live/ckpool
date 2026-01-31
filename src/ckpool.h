@@ -18,6 +18,7 @@
 
 #include "libckpool.h"
 #include "uthash.h"
+#include <openssl/ssl.h>
 
 #define RPC_TIMEOUT 60
 
@@ -90,6 +91,11 @@ struct connsock {
 	sem_t sem;
 
 	bool alive;
+
+	/* SSL/TLS */
+    SSL *ssl;
+    SSL_CTX *ssl_ctx;
+    bool tls_enabled;
 };
 
 typedef struct connsock connsock_t;
@@ -281,6 +287,16 @@ struct ckpool_instance {
 	void *gdata;
 	void *sdata;
 	void *cdata;
+
+    /* SSL/TLS */
+    char *tls_cert_file;
+    char *tls_key_file;
+    char *tls_ca_file;
+    bool tls_verify_peer;
+    bool tls_enabled;
+    int tls_port;
+    bool plaintext_enabled;
+    int plaintext_port;
 };
 
 enum stratum_msgtype {

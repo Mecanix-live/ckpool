@@ -1083,11 +1083,149 @@ static void launch_logger(ckpool_t *ckp)
 	ckp->console_logger = create_ckmsgq(ckp, "conlog", &console_log);
 }
 
+//static void clean_up(ckpool_t *ckp)
+//{
+//	rm_namepid(&ckp->main);
+//	dealloc(ckp->socket_dir);
+//}
+
 static void clean_up(ckpool_t *ckp)
 {
-	rm_namepid(&ckp->main);
-	dealloc(ckp->socket_dir);
+    int i;
+
+    rm_namepid(&ckp->main);
+
+    // Free TLS certificate paths
+    if (ckp->tls_cert_file)
+        free(ckp->tls_cert_file);
+    if (ckp->tls_key_file)
+        free(ckp->tls_key_file);
+    if (ckp->tls_ca_file)
+        free(ckp->tls_ca_file);
+
+    // Free server URLs
+    if (ckp->serverurl) {
+        for (i = 0; i < ckp->serverurls; i++) {
+            if (ckp->serverurl[i])
+                free(ckp->serverurl[i]);
+        }
+        free(ckp->serverurl);
+    }
+
+    // Free server arrays
+    if (ckp->server_highdiff)
+        free(ckp->server_highdiff);
+    if (ckp->nodeserver)
+        free(ckp->nodeserver);
+    if (ckp->trusted)
+        free(ckp->trusted);
+
+    // Free btcd arrays
+    if (ckp->btcdurl) {
+        for (i = 0; i < ckp->btcds; i++) {
+            if (ckp->btcdurl[i])
+                free(ckp->btcdurl[i]);
+        }
+        free(ckp->btcdurl);
+    }
+    if (ckp->btcdauth) {
+        for (i = 0; i < ckp->btcds; i++) {
+            if (ckp->btcdauth[i])
+                free(ckp->btcdauth[i]);
+        }
+        free(ckp->btcdauth);
+    }
+    if (ckp->btcdpass) {
+        for (i = 0; i < ckp->btcds; i++) {
+            if (ckp->btcdpass[i])
+                free(ckp->btcdpass[i]);
+        }
+        free(ckp->btcdpass);
+    }
+    if (ckp->btcdnotify)
+        free(ckp->btcdnotify);
+
+    // Free proxy arrays
+    if (ckp->proxyurl) {
+        for (i = 0; i < ckp->proxies; i++) {
+            if (ckp->proxyurl[i])
+                free(ckp->proxyurl[i]);
+        }
+        free(ckp->proxyurl);
+    }
+    if (ckp->proxyauth) {
+        for (i = 0; i < ckp->proxies; i++) {
+            if (ckp->proxyauth[i])
+                free(ckp->proxyauth[i]);
+        }
+        free(ckp->proxyauth);
+    }
+    if (ckp->proxypass) {
+        for (i = 0; i < ckp->proxies; i++) {
+            if (ckp->proxypass[i])
+                free(ckp->proxypass[i]);
+        }
+        free(ckp->proxypass);
+    }
+
+    // Free redirect URLs
+    if (ckp->redirecturl) {
+        for (i = 0; i < ckp->redirecturls; i++) {
+            if (ckp->redirecturl[i])
+                free(ckp->redirecturl[i]);
+        }
+        free(ckp->redirecturl);
+    }
+    if (ckp->redirectport) {
+        for (i = 0; i < ckp->redirecturls; i++) {
+            if (ckp->redirectport[i])
+                free(ckp->redirectport[i]);
+        }
+        free(ckp->redirectport);
+    }
+
+    // Free other strings
+    if (ckp->config)
+        free(ckp->config);
+    if (ckp->socket_dir)
+        free(ckp->socket_dir);
+    if (ckp->logdir)
+        free(ckp->logdir);
+    if (ckp->logfilename)
+        free(ckp->logfilename);
+    if (ckp->btcaddress)
+        free(ckp->btcaddress);
+    if (ckp->btcsig)
+        free(ckp->btcsig);
+    if (ckp->upstream)
+        free(ckp->upstream);
+    if (ckp->zmqblock)
+        free(ckp->zmqblock);
+
+    // Free initial args
+    if (ckp->initial_args) {
+        for (i = 0; i < ckp->args; i++) {
+            if (ckp->initial_args[i])
+                free(ckp->initial_args[i]);
+        }
+        free(ckp->initial_args);
+    }
+
+    // Free old connection file descriptors
+    if (ckp->oldconnfd)
+        free(ckp->oldconnfd);
+
+    // Close log file
+    if (ckp->logfp) {
+        fflush(ckp->logfp);
+        fclose(ckp->logfp);
+        ckp->logfp = NULL;
+        ckp->logfd = -1;
+    }
+
+    LOGWARNING("Cleanup completed for %s", ckp->name);
 }
+
 
 static void cancel_pthread(pthread_t *pth)
 {
@@ -1307,34 +1445,41 @@ static void parse_proxies(ckpool_t *ckp, const json_t *arr_val, const int arr_si
 
 static bool parse_serverurls(ckpool_t *ckp, const json_t *arr_val)
 {
-	bool ret = false;
-	int arr_size, i;
+    bool ret = false;
+    int arr_size, i;
 
-	if (!arr_val)
-		goto out;
-	if (!json_is_array(arr_val)) {
-		LOGINFO("Unable to parse serverurl entries as an array");
-		goto out;
-	}
-	arr_size = json_array_size(arr_val);
-	if (!arr_size) {
-		LOGWARNING("Serverurl array empty");
-		goto out;
-	}
-	ckp->serverurls = arr_size;
-	ckp->serverurl = ckalloc(sizeof(char *) * arr_size);
-	ckp->server_highdiff = ckzalloc(sizeof(bool) * arr_size);
-	ckp->nodeserver = ckzalloc(sizeof(bool) * arr_size);
-	ckp->trusted = ckzalloc(sizeof(bool) * arr_size);
-	for (i = 0; i < arr_size; i++) {
-		json_t *val = json_array_get(arr_val, i);
+    if (!arr_val)
+        goto out;
+    if (!json_is_array(arr_val)) {
+        LOGINFO("Unable to parse serverurl entries as an array");
+        goto out;
+    }
+    arr_size = json_array_size(arr_val);
+    if (!arr_size) {
+        LOGWARNING("Serverurl array empty");
+        goto out;
+    }
+    ckp->serverurls = arr_size;
+    ckp->serverurl = ckalloc(sizeof(char *) * arr_size);
+    ckp->server_highdiff = ckzalloc(sizeof(bool) * arr_size);
+    ckp->nodeserver = ckzalloc(sizeof(bool) * arr_size);
+    ckp->trusted = ckzalloc(sizeof(bool) * arr_size);
 
-		if (!_json_get_string(&ckp->serverurl[i], val, "serverurl"))
-			LOGWARNING("Invalid serverurl entry number %d", i);
-	}
-	ret = true;
+    for (i = 0; i < arr_size; i++) {
+        json_t *val = json_array_get(arr_val, i);
+        char *url = NULL;
+
+        if (!_json_get_string(&url, val, "serverurl")) {
+            LOGWARNING("Invalid serverurl entry number %d", i);
+            continue;
+        }
+
+        ckp->serverurl[i] = url;
+    }
+
+    ret = true;
 out:
-	return ret;
+    return ret;
 }
 
 static void parse_nodeservers(ckpool_t *ckp, const json_t *arr_val)
@@ -1396,7 +1541,6 @@ static void parse_trusted(ckpool_t *ckp, const json_t *arr_val)
 	ckp->serverurls = total_urls;
 }
 
-
 static bool parse_redirecturls(ckpool_t *ckp, const json_t *arr_val)
 {
 	bool ret = false;
@@ -1432,7 +1576,6 @@ static bool parse_redirecturls(ckpool_t *ckp, const json_t *arr_val)
 out:
 	return ret;
 }
-
 
 static void parse_config(ckpool_t *ckp)
 {
@@ -1504,6 +1647,132 @@ static void parse_config(ckpool_t *ckp)
 	if (arr_val)
 		parse_redirecturls(ckp, arr_val);
 	json_get_string(&ckp->zmqblock, json_conf, "zmqblock");
+
+	// ====== TLS =========
+	json_t *tls_enabled_val = json_object_get(json_conf, "tls_enabled");
+	json_t *plaintext_enabled_val = json_object_get(json_conf, "plaintext_enabled");
+	json_t *tls_cert_val = json_object_get(json_conf, "tls_cert");
+	json_t *tls_key_val = json_object_get(json_conf, "tls_key");
+	json_t *tls_ca_val = json_object_get(json_conf, "tls_ca");
+	json_t *tls_verify_val = json_object_get(json_conf, "tls_verify");
+	json_t *plaintext_port_val = json_object_get(json_conf, "plaintext_port");
+	json_t *tls_port_val = json_object_get(json_conf, "tls_port");
+
+	if (tls_enabled_val && json_is_boolean(tls_enabled_val)) {
+	    ckp->tls_enabled = json_is_true(tls_enabled_val);
+	} else {
+	    // Default to true if TLS certificate is provided
+	    ckp->tls_enabled = (tls_cert_val != NULL && tls_key_val != NULL);
+	}
+
+	if (plaintext_enabled_val && json_is_boolean(plaintext_enabled_val)) {
+	    ckp->plaintext_enabled = json_is_true(plaintext_enabled_val);
+	} else {
+	    // Default to true for backward compatibility
+	    ckp->plaintext_enabled = true;
+	}
+
+	if (tls_cert_val && json_is_string(tls_cert_val)) {
+	    ckp->tls_cert_file = strdup(json_string_value(tls_cert_val));
+	}
+	if (tls_key_val && json_is_string(tls_key_val)) {
+	    ckp->tls_key_file = strdup(json_string_value(tls_key_val));
+	}
+	if (tls_ca_val && json_is_string(tls_ca_val)) {
+	    ckp->tls_ca_file = strdup(json_string_value(tls_ca_val));
+	}
+
+	if (tls_verify_val && json_is_boolean(tls_verify_val)) {
+	    ckp->tls_verify_peer = json_is_true(tls_verify_val);
+	} else {
+	    ckp->tls_verify_peer = false;
+	}
+
+	if (plaintext_port_val && json_is_integer(plaintext_port_val)) {
+	    ckp->plaintext_port = json_integer_value(plaintext_port_val);
+	} else {
+	    ckp->plaintext_port = 3333; // Default
+	}
+
+	if (tls_port_val && json_is_integer(tls_port_val)) {
+	    ckp->tls_port = json_integer_value(tls_port_val);
+	} else {
+	    ckp->tls_port = 3443; // Default
+	}
+
+	// Parse serverurls
+	if (!parse_serverurls(ckp, arr_val)) {
+	    if (json_get_string(&url, json_conf, "serverurl")) {
+	        ckp->serverurl = ckalloc(sizeof(char *));
+	        ckp->serverurl[0] = url;
+	        ckp->serverurls = 1;
+
+	        // For backward compatibility: If only one serverurl is specified,
+	        // auto-detect whether it should be TLS or plaintext based on port
+	        char *colon = strrchr(url, ':');
+	        if (colon) {
+	            int port = atoi(colon + 1);
+	            if (port == ckp->plaintext_port || port == 3333) {
+	                // If it matches plaintext port or default, use plaintext
+	                ckp->plaintext_enabled = true;
+	                ckp->tls_enabled = false;
+	                LOGNOTICE("Single serverurl %s detected as plaintext (port %d)", url, port);
+	            } else if (port == ckp->tls_port || port == 3443 || port == 443) {
+	                // If it matches TLS port or common TLS ports, use TLS
+	                ckp->tls_enabled = true;
+	                ckp->plaintext_enabled = false;
+	                LOGNOTICE("Single serverurl %s detected as TLS (port %d)", url, port);
+	            }
+	        }
+	    }
+	}
+
+	// Validate that at least one protocol is enabled
+	if (!ckp->tls_enabled && !ckp->plaintext_enabled) {
+	    LOGEMERG("Both TLS and plaintext are disabled - must enable at least one protocol");
+	    exit(1);
+	}
+
+	// Validate ports if protocols are enabled
+	if (ckp->plaintext_enabled) {
+	    if (ckp->plaintext_port < 1 || ckp->plaintext_port > 65535) {
+	        LOGEMERG("Invalid plaintext port %d (must be 1-65535)", ckp->plaintext_port);
+	        exit(1);
+	    }
+	}
+
+	if (ckp->tls_enabled) {
+	    if (ckp->tls_port < 1 || ckp->tls_port > 65535) {
+	        LOGEMERG("Invalid TLS port %d (must be 1-65535)", ckp->tls_port);
+	        exit(1);
+	    }
+
+	    // Check that TLS certificate files are specified
+	    if (!ckp->tls_cert_file || !ckp->tls_key_file) {
+	        LOGEMERG("TLS enabled but 'tls_cert' and/or 'tls_key' not specified in config");
+	        exit(1);
+	    }
+	}
+
+	// Check for port conflicts
+	if (ckp->tls_enabled && ckp->plaintext_enabled && ckp->plaintext_port == ckp->tls_port) {
+	    LOGEMERG("Plaintext port %d cannot be the same as TLS port %d",
+	             ckp->plaintext_port, ckp->tls_port);
+	    exit(1);
+	}
+
+    LOGINFO("==TLS== tls_enabled_val: %d", ckp->tls_enabled);
+    LOGINFO("==TLS== tls_port_val: %d", ckp->tls_port);
+    LOGINFO("==TLS== plaintext_enabled_val: %d", ckp->plaintext_enabled);
+    LOGINFO("==TLS== plaintext_port_val: %d", ckp->plaintext_port);
+    LOGINFO("==TLS== tls_cert_val: %s", ckp->tls_cert_file);
+    LOGINFO("==TLS== tls_key_val: %s", ckp->tls_key_file);
+    LOGINFO("==TLS== tls_ca_val: %s", ckp->tls_ca_file);
+    LOGINFO("==TLS== tls_verify_val: %d", ckp->tls_verify_peer);
+
+	LOGINFO("==TLS== Port Configuration: plaintext_port=%d, tls_port=%d",
+			ckp->plaintext_port, ckp->tls_port);
+    // ====== TLS =========
 
 	json_decref(json_conf);
 }
@@ -1747,6 +2016,7 @@ int main(int argc, char **argv)
 		quit(1, "Failed to make directory %s", ckp.socket_dir);
 
 	parse_config(&ckp);
+
 	/* Set defaults if not found in config file */
 	if (!ckp.btcds) {
 		ckp.btcds = 1;

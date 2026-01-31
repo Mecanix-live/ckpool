@@ -31,8 +31,13 @@ target_link_libraries(ckpool
 	${M_LIB} 
 	${RT_LIB} 
 	${ZMQ_LIB}
+	${SSL_LIB}
 	${OpenSSL_LIB}
 )
+
+# Add OpenSSL includes
+target_include_directories(ckpool PRIVATE ${OPENSSL_INCLUDE_DIR})
+target_include_directories(ckpool_lib PRIVATE ${OPENSSL_INCLUDE_DIR})
 
 # Installation
 install(TARGETS ckpool

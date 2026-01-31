@@ -1,5 +1,6 @@
 /*
  * Copyright 2014-2017 Con Kolivas
+ * Modified for TLS-only operation
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -15,6 +16,9 @@
 #include <sys/socket.h>
 #include <string.h>
 #include <unistd.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/rand.h>
 
 #include "ckpool.h"
 #include "libckpool.h"
@@ -35,8 +39,10 @@ struct client_instance {
 	UT_hash_handle hh;
 	int64_t id;
 
-	/* fd cannot be changed while a ref is held */
-	int fd;
+	/* SSL context for this client */
+	SSL *ssl;
+	BIO *bio;
+	int fd;  /* Underlying socket fd */
 
 	/* Reference count for when this instance is used outside of the
 	 * connector_data lock */
@@ -51,7 +57,6 @@ struct client_instance {
 
 	client_instance_t *recycled_next;
 	client_instance_t *recycled_prev;
-
 
 	struct sockaddr_storage address_storage;
 	struct sockaddr *address;
@@ -85,6 +90,12 @@ struct client_instance {
 
 	/* The size of the socket send buffer */
 	int sendbufsize;
+
+	/* SSL handshake state */
+	bool tls_connection;  /* TRUE if this is a TLS connection */
+	bool handshake_complete;
+	bool handshake_in_progress;
+
 };
 
 struct sender_send {
@@ -122,6 +133,8 @@ struct connector_data {
 
 	/* Array of server fds */
 	int *serverfd;
+	/* SSL context for listeners */
+	SSL_CTX *ssl_ctx;
 	/* All time count of clients connected */
 	int nfds;
 	/* The epoll fd */
@@ -172,9 +185,150 @@ struct connector_data {
 
 	/* Have we given the warning about inability to raise sendbuf size */
 	bool wmem_warn;
+
+	/* SSL/TLS configuration */
+	char *cert_file;
+	char *key_file;
+	char *ca_file;
+	bool verify_peer;
+	bool *server_is_tls;
 };
 
 typedef struct connector_data cdata_t;
+
+/* SSL/TLS helper functions */
+static SSL_CTX* create_ssl_context(cdata_t *cdata) {
+	SSL_CTX *ctx = NULL;
+	const SSL_METHOD *method;
+
+	SSL_library_init();
+	SSL_load_error_strings();
+	OpenSSL_add_all_algorithms();
+
+	method = TLS_server_method();  /* Use TLS_method() for general case */
+	ctx = SSL_CTX_new(method);
+
+	if (!ctx) {
+		LOGERR("Unable to create SSL context");
+		return NULL;
+	}
+
+	/* Set minimum TLS version */
+	SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+
+	/* Load certificate and private key */
+	if (SSL_CTX_use_certificate_file(ctx, cdata->cert_file, SSL_FILETYPE_PEM) <= 0) {
+		LOGERR("Error loading certificate from %s", cdata->cert_file);
+		ERR_print_errors_fp(stderr);
+		SSL_CTX_free(ctx);
+		return NULL;
+	}
+
+	if (SSL_CTX_use_PrivateKey_file(ctx, cdata->key_file, SSL_FILETYPE_PEM) <= 0) {
+		LOGERR("Error loading private key from %s", cdata->key_file);
+		ERR_print_errors_fp(stderr);
+		SSL_CTX_free(ctx);
+		return NULL;
+	}
+
+	/* Verify private key matches certificate */
+	if (!SSL_CTX_check_private_key(ctx)) {
+		LOGERR("Private key does not match the certificate");
+		SSL_CTX_free(ctx);
+		return NULL;
+	}
+
+	/* Load CA certificates for client verification if enabled */
+	if (cdata->ca_file) {
+	    if (SSL_CTX_load_verify_locations(ctx, cdata->ca_file, NULL) <= 0) {
+	        LOGERR("Error loading CA certificate from %s", cdata->ca_file);
+	        ERR_print_errors_fp(stderr);
+	        SSL_CTX_free(ctx);
+	        return NULL;
+	    }
+
+	    if (cdata->verify_peer) {
+	        /* Load our own certificate chain for clients to verify */
+	        if (SSL_CTX_use_certificate_chain_file(ctx, cdata->cert_file) <= 0) {
+	            LOGWARNING("Failed to load certificate chain, falling back to single certificate");
+	        }
+	        LOGINFO("CA loaded and TLS verification enabled");
+	    } else {
+	        LOGINFO("CA loaded but client certificate verification disabled");
+	    }
+	}
+
+	/* Always set verify mode based on verify_peer */
+	if (cdata->verify_peer) {
+	    /* For mining pools: verify clients only if they provide certificates */
+	    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+	} else {
+	    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+	}
+	SSL_CTX_set_verify_depth(ctx, 4);
+
+	/* Set cipher list */
+	SSL_CTX_set_cipher_list(ctx, "HIGH:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA");
+
+	/* Enable ephemeral DH parameters */
+	SSL_CTX_set_dh_auto(ctx, 1);
+
+	return ctx;
+}
+
+static SSL* create_ssl_client(cdata_t *cdata, int fd) {
+	SSL *ssl = SSL_new(cdata->ssl_ctx);
+	if (!ssl) {
+		LOGERR("Unable to create SSL structure");
+		return NULL;
+	}
+
+	if (!SSL_set_fd(ssl, fd)) {
+		LOGERR("Unable to set SSL file descriptor");
+		SSL_free(ssl);
+		return NULL;
+	}
+
+	SSL_set_mode(ssl, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+	SSL_set_accept_state(ssl);
+
+	return ssl;
+}
+
+static void free_ssl_client(client_instance_t *client) {
+	if (client->ssl) {
+		SSL_shutdown(client->ssl);
+		SSL_free(client->ssl);
+		client->ssl = NULL;
+	}
+	if (client->bio) {
+		BIO_free_all(client->bio);
+		client->bio = NULL;
+	}
+}
+
+static int tls_handshake(client_instance_t *client) {
+	int ret = SSL_accept(client->ssl);
+
+	if (ret == 1) {
+		client->handshake_complete = true;
+		client->handshake_in_progress = false;
+		LOGDEBUG("TLS handshake completed for client %"PRId64, client->id);
+		return 1;
+	}
+
+	int ssl_err = SSL_get_error(client->ssl, ret);
+	if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
+		client->handshake_in_progress = true;
+		return 0;  /* Need more I/O */
+	}
+
+	/* Handshake failed */
+	char err_buf[256];
+	ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
+	LOGINFO("TLS handshake failed for client %"PRId64": %s", client->id, err_buf);
+	return -1;
+}
 
 void connector_upstream_msg(ckpool_t *ckp, char *msg)
 {
@@ -197,7 +351,7 @@ static void inc_instance_ref(cdata_t *cdata, client_instance_t *client)
 	ck_wunlock(&cdata->lock);
 }
 
-/* Increase the reference count of instance */
+/* Decrease the reference count of instance */
 static void __dec_instance_ref(client_instance_t *client)
 {
 	client->ref--;
@@ -231,12 +385,18 @@ static client_instance_t *recruit_client(cdata_t *cdata)
 		LOGDEBUG("Connector recycled client instance");
 
 	client->buf = ckzalloc(PAGESIZE);
+	client->ssl = NULL;
+	client->handshake_complete = false;
+	client->handshake_in_progress = false;
 
 	return client;
 }
 
 static void __recycle_client(cdata_t *cdata, client_instance_t *client)
 {
+	if (client->ssl) {
+		free_ssl_client(client);
+	}
 	dealloc(client->buf);
 	memset(client, 0, sizeof(client_instance_t));
 	client->id = -1;
@@ -265,7 +425,7 @@ int64_t connector_newclientid(ckpool_t *ckp)
 }
 
 /* Accepts incoming connections on the server socket and generates client
- * instances */
+ * instances with TLS handshake */
 static int accept_client(cdata_t *cdata, const int epfd, const uint64_t server)
 {
 	int fd, port, no_clients, sockd;
@@ -291,8 +451,6 @@ static int accept_client(cdata_t *cdata, const int epfd, const uint64_t server)
 	address_len = sizeof(client->address_storage);
 	fd = accept(sockd, client->address, &address_len);
 	if (unlikely(fd < 0)) {
-		/* Handle these errors gracefully should we ever share this
-		 * socket */
 		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED) {
 			LOGERR("Recoverable error on accept in accept_client");
 			return 0;
@@ -330,6 +488,50 @@ static int accept_client(cdata_t *cdata, const int epfd, const uint64_t server)
 	LOGINFO("Connected new client %d on socket %d to %d active clients from %s:%d",
 		cdata->nfds, fd, no_clients, client->address_name, port);
 
+	/* Set the fd FIRST (both TLS and plaintext need this!) */
+	client->fd = fd;
+
+	bool is_tls_listener = cdata->server_is_tls[server];
+
+	if (is_tls_listener) {
+	    /* TLS connection - create SSL context */
+	    client->ssl = create_ssl_client(cdata, fd);
+	    client->tls_connection = true;
+
+	    if (!client->ssl) {
+	        LOGWARNING("Failed to create SSL for client from %s:%d", client->address_name, port);
+	        Close(fd);
+	        recycle_client(cdata, client);
+	        return 0;
+	    }
+
+	    /* Start TLS handshake */
+	    int handshake_ret = tls_handshake(client);
+	    if (handshake_ret == -1) {
+	        LOGINFO("TLS handshake failed immediately for client from %s:%d",
+	            client->address_name, port);
+	        free_ssl_client(client);
+	        Close(fd);
+	        recycle_client(cdata, client);
+	        return 0;
+	    }
+
+	    /* If handshake still in progress, we'll continue in client_event_processor */
+	    if (handshake_ret == 0) {
+	        client->handshake_complete = false;
+	        client->handshake_in_progress = true;
+	    } else {
+	        client->handshake_complete = true;
+	        client->handshake_in_progress = false;
+	    }
+	} else {
+	    /* Plaintext connection */
+	    client->ssl = NULL;
+	    client->tls_connection = false;
+	    client->handshake_complete = true; /* No handshake needed */
+	    client->handshake_in_progress = false;
+	}
+
 	ck_wlock(&cdata->lock);
 	client->id = cdata->client_ids++;
 	HASH_ADD_I64(cdata->clients, id, client);
@@ -340,13 +542,14 @@ static int accept_client(cdata_t *cdata, const int epfd, const uint64_t server)
 	 * to it. We drop that reference when the socket is closed which
 	 * removes it automatically from the epoll list. */
 	__inc_instance_ref(client);
-	client->fd = fd;
+
 	optlen = sizeof(client->sendbufsize);
 	getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &client->sendbufsize, &optlen);
 	LOGDEBUG("Client sendbufsize detected as %d", client->sendbufsize);
 
 	event.data.u64 = client->id;
-	event.events = EPOLLIN | EPOLLRDHUP | EPOLLONESHOT;
+	/* Monitor for both read and write during handshake */
+	event.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLONESHOT;
 	if (unlikely(epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event) < 0)) {
 		LOGERR("Failed to epoll_ctl add in accept_client");
 		dec_instance_ref(cdata, client);
@@ -365,11 +568,11 @@ static int __drop_client(cdata_t *cdata, client_instance_t *client)
 	client->invalid = true;
 	ret = client->fd;
 	/* Closing the fd will automatically remove it from the epoll list */
+	free_ssl_client(client);
 	Close(client->fd);
 	HASH_DEL(cdata->clients, client);
 	DL_APPEND2(cdata->dead_clients, client, dead_prev, dead_next);
-	/* This is the reference to this client's presence in the
-	 * epoll list. */
+	/* This is the reference to this client's presence in the epoll list. */
 	__dec_instance_ref(client);
 	cdata->dead_generated++;
 out:
@@ -418,8 +621,7 @@ static void generator_drop_client(ckpool_t *ckp, const client_instance_t *client
 	json_t *val;
 
 	JSON_CPACK(val, "{si,sI:ss:si:ss:s[]}", "id", 42, "client_id", client->id, "address",
-		   client->address_name, "server", client->server, "method", "mining.term",
-		   "params");
+		   client->address_name, "server", client->server, "method", "mining.term", "params");
 	generator_add_send(ckp, val);
 }
 
@@ -495,8 +697,6 @@ static void parse_redirector_share(cdata_t *cdata, client_instance_t *client, co
 
 	LOGINFO("Redirector adding client %"PRId64" share id: %"PRId64, client->id, id);
 
-	/* We use the cdata lock instead of a separate lock since this function
-	 * is called infrequently. */
 	ck_wlock(&cdata->lock);
 	DL_APPEND(client->shares, share);
 
@@ -510,6 +710,57 @@ static void parse_redirector_share(cdata_t *cdata, client_instance_t *client, co
 	ck_wunlock(&cdata->lock);
 }
 
+static int tls_read(client_instance_t *client, void *buf, size_t len) {
+    if (client->tls_connection && client->ssl) {
+        /* TLS read */
+        int ret = SSL_read(client->ssl, buf, len);
+
+        if (ret > 0) {
+            return ret;
+        }
+
+        int ssl_err = SSL_get_error(client->ssl, ret);
+
+        if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
+            errno = EAGAIN;
+            return -1;
+        }
+
+        if (ssl_err == SSL_ERROR_ZERO_RETURN) {
+            /* TLS connection closed cleanly */
+            return 0;
+        }
+
+        /* Real TLS error */
+        char err_buf[256];
+        ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
+        LOGINFO("TLS read error for client %"PRId64": %s", client->id, err_buf);
+
+        return -1;
+    } else {
+        /* Plaintext read - FIX: Use recv() with MSG_DONTWAIT */
+        int ret = recv(client->fd, buf, len, MSG_DONTWAIT);
+
+        if (ret > 0) {
+            return ret;
+        }
+
+        if (ret == 0) {
+            /* Connection closed cleanly */
+            return 0;
+        }
+
+        /* Check for EAGAIN/EWOULDBLOCK */
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return -1;  /* Would block */
+        }
+
+        LOGINFO("Plaintext read error for client %"PRId64": %s",
+                client->id, strerror(errno));
+        return -1;
+    }
+}
+
 /* Client is holding a reference count from being on the epoll list. Returns
  * true if we will still be receiving messages from this client. */
 static bool parse_client_msg(ckpool_t *ckp, cdata_t *cdata, client_instance_t *client)
@@ -517,6 +768,20 @@ static bool parse_client_msg(ckpool_t *ckp, cdata_t *cdata, client_instance_t *c
 	int buflen, ret;
 	json_t *val;
 	char *eol;
+
+	/* Handle TLS handshake if not complete */
+	if (!client->handshake_complete) {
+		int handshake_ret = tls_handshake(client);
+		if (handshake_ret == 0) {
+			/* Handshake still in progress */
+			return true;
+		}
+		if (handshake_ret == -1) {
+			/* Handshake failed */
+			return false;
+		}
+		/* Handshake completed successfully, continue to read data */
+	}
 
 retry:
 	if (unlikely(client->bufofs > MAX_MSGSIZE)) {
@@ -527,8 +792,9 @@ retry:
 		}
 		client->buf = realloc(client->buf, round_up_page(client->bufofs + MAX_MSGSIZE + 1));
 	}
-	/* This read call is non-blocking since the socket is set to O_NOBLOCK */
-	ret = read(client->fd, client->buf + client->bufofs, MAX_MSGSIZE);
+
+	/* Use TLS read instead of plain read */
+	ret = tls_read(client, client->buf + client->bufofs, MAX_MSGSIZE);
 	if (ret < 1) {
 		if (likely(errno == EAGAIN || errno == EWOULDBLOCK || !ret))
 			return true;
@@ -570,9 +836,6 @@ reparse:
 		}
 		json_object_set_new_nocheck(val, "server", json_integer(client->server));
 
-		/* Do not send messages of clients we've already dropped. We
-		 * do this unlocked as the occasional false negative can be
-		 * filtered by the stratifier. */
 		if (likely(!client->invalid)) {
 			if (!ckp->passthrough)
 				stratifier_add_recv(ckp, val);
@@ -635,6 +898,25 @@ static void client_event_processor(ckpool_t *ckp, struct epoll_event *event)
 		LOGNOTICE("Failed to find client by id %"PRId64" in receiver!", id);
 		goto outnoclient;
 	}
+
+	/* Handle handshake phase */
+	if (!client->handshake_complete) {
+		int handshake_ret = tls_handshake(client);
+		if (handshake_ret == 0) {
+			/* Still handshaking, rearm with both read and write */
+			event->data.u64 = id;
+			event->events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLONESHOT;
+			epoll_ctl(cdata->epfd, EPOLL_CTL_MOD, client->fd, event);
+			goto out;
+		}
+		if (handshake_ret == -1) {
+			/* Handshake failed */
+			invalidate_client(ckp, cdata, client);
+			goto out;
+		}
+		/* Handshake completed, continue with normal processing */
+	}
+
 	/* We can have both messages and read hang ups so process the
 	 * message first. */
 	if (likely(events & EPOLLIN)) {
@@ -649,8 +931,6 @@ static void client_event_processor(ckpool_t *ckp, struct epoll_event *event)
 		socklen_t errlen = sizeof(int);
 		int error = 0;
 
-		/* See what type of error this is and raise the log
-			* level of the message if it's unexpected. */
 		getsockopt(client->fd, SOL_SOCKET, SO_ERROR, (void *)&error, &errlen);
 		if (error != 104) {
 			LOGNOTICE("Client id %"PRId64" fd %d epollerr HUP in epoll with errno %d: %s",
@@ -673,6 +953,7 @@ out:
 	if (likely(!client->invalid)) {
 		/* Rearm the fd in the epoll list if it's still active */
 		event->data.u64 = id;
+		/* Only monitor for read after handshake is complete */
 		event->events = EPOLLIN | EPOLLRDHUP | EPOLLONESHOT;
 		epoll_ctl(cdata->epfd, EPOLL_CTL_MOD, client->fd, event);
 	}
@@ -748,6 +1029,47 @@ out:
 	return NULL;
 }
 
+static int tls_write(client_instance_t *client, const void *buf, size_t len) {
+    if (client->tls_connection && client->ssl) {
+        /* TLS write */
+        int ret = SSL_write(client->ssl, buf, len);
+
+        if (ret > 0) {
+            return ret;
+        }
+
+        int ssl_err = SSL_get_error(client->ssl, ret);
+
+        if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
+            errno = EAGAIN;
+            return -1;
+        }
+
+        /* Real TLS error */
+        char err_buf[256];
+        ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
+        LOGINFO("TLS write error for client %"PRId64": %s", client->id, err_buf);
+
+        return -1;
+    } else {
+        /* Plaintext write - FIX: Use send() with MSG_DONTWAIT */
+        int ret = send(client->fd, buf, len, MSG_DONTWAIT);
+
+        if (ret > 0) {
+            return ret;
+        }
+
+        /* Check for EAGAIN/EWOULDBLOCK */
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return -1;  /* Would block */
+        }
+
+        LOGINFO("Plaintext write error for client %"PRId64": %s",
+                client->id, strerror(errno));
+        return -1;
+    }
+}
+
 /* Send a sender_send message and return true if we've finished sending it or
  * are unable to send any more. */
 static bool send_sender_send(ckpool_t *ckp, cdata_t *cdata, sender_send_t *sender_send)
@@ -771,7 +1093,8 @@ static bool send_sender_send(ckpool_t *ckp, cdata_t *cdata, sender_send_t *sende
 		client->sendbufsize = set_sendbufsize(ckp, client->fd, sender_send->len);
 
 	while (sender_send->len) {
-		int ret = write(client->fd, sender_send->buf + sender_send->ofs, sender_send->len);
+		/* Use TLS write instead of plain write */
+		int ret = tls_write(client, sender_send->buf + sender_send->ofs, sender_send->len);
 
 		if (ret < 1) {
 			/* Invalidate clients that block for more than 60 seconds */
@@ -1144,6 +1467,7 @@ static void passthrough_client(ckpool_t *ckp, cdata_t *cdata, client_instance_t 
 		client->sendbufsize = set_sendbufsize(ckp, client->fd, 1048576);
 }
 
+/* Modified connect_upstream to use TLS */
 static bool connect_upstream(ckpool_t *ckp, connsock_t *cs)
 {
 	json_t *req, *val = NULL, *res_val, *err_val;
@@ -1157,6 +1481,43 @@ static bool connect_upstream(ckpool_t *ckp, connsock_t *cs)
 		goto out;
 	}
 	keep_sockalive(cs->fd);
+
+	/* Create SSL context for upstream connection */
+	SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_client_method());
+	if (!ssl_ctx) {
+		LOGWARNING("Failed to create SSL context for upstream");
+		goto out;
+	}
+
+	SSL *ssl = SSL_new(ssl_ctx);
+	if (!ssl) {
+		LOGWARNING("Failed to create SSL for upstream");
+		SSL_CTX_free(ssl_ctx);
+		goto out;
+	}
+
+	if (!SSL_set_fd(ssl, cs->fd)) {
+		LOGWARNING("Failed to set SSL fd for upstream");
+		SSL_free(ssl);
+		SSL_CTX_free(ssl_ctx);
+		goto out;
+	}
+
+	SSL_set_connect_state(ssl);
+
+	/* Perform TLS handshake */
+	int ssl_ret = SSL_connect(ssl);
+	if (ssl_ret != 1) {
+		char err_buf[256];
+		ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
+		LOGWARNING("TLS handshake failed for upstream: %s", err_buf);
+		SSL_free(ssl);
+		SSL_CTX_free(ssl_ctx);
+		goto out;
+	}
+
+	cs->ssl = ssl;
+	cs->ssl_ctx = ssl_ctx;
 
 	/* We want large send buffers for upstreaming messages */
 	if (!ckp->rmem_warn)
@@ -1197,6 +1558,7 @@ out:
 	return ret;
 }
 
+/* Modified usend_process to use TLS */
 static void usend_process(ckpool_t *ckp, char *buf)
 {
 	cdata_t *cdata = ckp->cdata;
@@ -1210,11 +1572,23 @@ static void usend_process(ckpool_t *ckp, char *buf)
 	LOGDEBUG("Sending upstream msg: %s", buf);
 	len = strlen(buf);
 	while (42) {
-		sent = write_socket(cs->fd, buf, len);
+		/* Use SSL_write for TLS */
+		if (cs->ssl) {
+			sent = SSL_write(cs->ssl, buf, len);
+		} else {
+			sent = write_socket(cs->fd, buf, len);
+		}
 		if (sent == len)
 			break;
 		if (cs->fd > 0) {
 			LOGWARNING("Upstream pool failed, attempting reconnect while caching messages");
+			if (cs->ssl) {
+				SSL_shutdown(cs->ssl);
+				SSL_free(cs->ssl);
+				SSL_CTX_free(cs->ssl_ctx);
+				cs->ssl = NULL;
+				cs->ssl_ctx = NULL;
+			}
 			Close(cs->fd);
 		}
 		do
@@ -1233,6 +1607,7 @@ static void ping_upstream(cdata_t *cdata)
 	ckmsgq_add(cdata->upstream_sends, buf);
 }
 
+/* Modified urecv_process to use TLS */
 static void *urecv_process(void *arg)
 {
 	ckpool_t *ckp = (ckpool_t *)arg;
@@ -1251,7 +1626,16 @@ static void *urecv_process(void *arg)
 		int ret;
 
 		cksem_wait(&cs->sem);
-		ret = read_socket_line(cs, &timeout);
+		if (cs->ssl) {
+			char read_buf[4096];
+			ret = SSL_read(cs->ssl, read_buf, sizeof(read_buf) - 1);
+			if (ret > 0) {
+				read_buf[ret] = '\0';
+				strncpy(cs->buf, read_buf, sizeof(cs->buf) - 1);
+			}
+		} else {
+			ret = read_socket_line(cs, &timeout);
+		}
 		if (ret < 1) {
 			ping_upstream(cdata);
 			if (likely(!ret)) {
@@ -1567,108 +1951,221 @@ retry:
 
 void *connector(void *arg)
 {
-	proc_instance_t *pi = (proc_instance_t *)arg;
-	cdata_t *cdata = ckzalloc(sizeof(cdata_t));
-	char newurl[INET6_ADDRSTRLEN], newport[8];
-	int threads, sockd, i, tries = 0, ret;
-	ckpool_t *ckp = pi->ckp;
-	const int on = 1;
+    proc_instance_t *pi = (proc_instance_t *)arg;
+    cdata_t *cdata = ckzalloc(sizeof(cdata_t));
+    char newurl[INET6_ADDRSTRLEN], newport[8];
+    int threads, sockd, i, tries = 0, ret;
+    ckpool_t *ckp = pi->ckp;
+    const int on = 1;
 
-	rename_proc(pi->processname);
-	LOGWARNING("%s connector starting", ckp->name);
-	ckp->cdata = cdata;
-	cdata->ckp = ckp;
+    rename_proc(pi->processname);
+    LOGWARNING("%s connector starting", ckp->name);
+    ckp->cdata = cdata;
+    cdata->ckp = ckp;
 
-	if (!ckp->serverurls) {
-		/* No serverurls have been specified. Bind to all interfaces
-		 * on default sockets. */
-		struct sockaddr_in serv_addr;
+    /* Initialize SSL/TLS configuration */
+    if (ckp->tls_enabled) {
+        if (!ckp->tls_cert_file || !ckp->tls_key_file) {
+            LOGEMERG("TLS enabled but certificate or key file not specified in config");
+            goto out;
+        }
+        cdata->cert_file = strdup(ckp->tls_cert_file);
+        cdata->key_file = strdup(ckp->tls_key_file);
+        cdata->ca_file = ckp->tls_ca_file ? strdup(ckp->tls_ca_file) : NULL;
+        cdata->verify_peer = ckp->tls_verify_peer;
 
-		cdata->serverfd = ckalloc(sizeof(int *));
+        /* Create SSL context */
+        cdata->ssl_ctx = create_ssl_context(cdata);
+        if (!cdata->ssl_ctx) {
+            LOGEMERG("Failed to create SSL context");
+            goto out;
+        }
+    }
 
-		sockd = socket(AF_INET, SOCK_STREAM, 0);
-		if (sockd < 0) {
-			LOGERR("Connector failed to open socket");
-			goto out;
-		}
-		setsockopt(sockd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-		memset(&serv_addr, 0, sizeof(serv_addr));
-		serv_addr.sin_family = AF_INET;
-		serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-		serv_addr.sin_port = htons(ckp->proxy ? 3334 : 3333);
-		do {
-			ret = bind(sockd, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+    if (!ckp->serverurls) {
+        /* No serverurls specified - create default listeners based on configuration */
+        int listener_count = 0;
 
-			if (!ret)
-				break;
-			LOGWARNING("Connector failed to bind to socket, retrying in 5s");
-			sleep(5);
-		} while (++tries < 25);
-		if (ret < 0) {
-			LOGERR("Connector failed to bind to socket for 2 minutes");
-			Close(sockd);
-			goto out;
-		}
-		/* Set listen backlog to larger than SOMAXCONN in case the
-		 * system configuration supports it */
-		if (listen(sockd, 8192) < 0) {
-			LOGERR("Connector failed to listen on socket");
-			Close(sockd);
-			goto out;
-		}
-		cdata->serverfd[0] = sockd;
-		url_from_socket(sockd, newurl, newport);
-		ASPRINTF(&ckp->serverurl[0], "%s:%s", newurl, newport);
-		ckp->serverurls = 1;
-	} else {
-		cdata->serverfd = ckalloc(sizeof(int *) * ckp->serverurls);
+        /* Count how many listeners we'll create */
+        if (ckp->plaintext_enabled) listener_count++;
+        if (ckp->tls_enabled) listener_count++;
 
-		for (i = 0; i < ckp->serverurls; i++) {
-			char oldurl[INET6_ADDRSTRLEN], oldport[8];
-			char *serverurl = ckp->serverurl[i];
-			int port;
+        if (listener_count == 0) {
+            LOGEMERG("No listeners enabled - must enable plaintext and/or TLS");
+            goto out;
+        }
 
-			if (!url_from_serverurl(serverurl, newurl, newport)) {
-				LOGWARNING("Failed to extract resolved url from %s", serverurl);
-				goto out;
-			}
-			port = atoi(newport);
-			/* All high port servers are treated as highdiff ports */
-			if (port > 4000) {
-				LOGNOTICE("Highdiff server %s", serverurl);
-				ckp->server_highdiff[i] = true;
-			}
-			sockd = ckp->oldconnfd[i];
-			if (url_from_socket(sockd, oldurl, oldport)) {
-				if (strcmp(newurl, oldurl) || strcmp(newport, oldport)) {
-					LOGWARNING("Handed over socket url %s:%s does not match config %s:%s, creating new socket",
-						   oldurl, oldport, newurl, newport);
-					Close(sockd);
-				}
-			}
+        /* Allocate serverfd array */
+        cdata->serverfd = ckalloc(sizeof(int) * listener_count);
+        /* Allocate server TLS flags array */
+        cdata->server_is_tls = ckalloc(sizeof(bool) * listener_count);
 
-			do {
-				if (sockd > 0)
-					break;
-				sockd = bind_socket(newurl, newport);
-				if (sockd > 0)
-					break;
-				LOGWARNING("Connector failed to bind to socket, retrying in 5s");
-				sleep(5);
-			} while (++tries < 25);
+        int listener_index = 0;
 
-			if (sockd < 0) {
-				LOGERR("Connector failed to bind to socket for 2 minutes");
-				goto out;
-			}
-			if (listen(sockd, 8192) < 0) {
-				LOGERR("Connector failed to listen on socket");
-				Close(sockd);
-				goto out;
-			}
-			cdata->serverfd[i] = sockd;
-		}
-	}
+        /* Create plaintext listener if enabled */
+        if (ckp->plaintext_enabled) {
+            int plaintext_port = ckp->plaintext_port ? ckp->plaintext_port : 3333;
+
+            sockd = socket(AF_INET, SOCK_STREAM, 0);
+            if (sockd < 0) {
+                LOGERR("Connector failed to open plaintext socket");
+                goto out;
+            }
+            setsockopt(sockd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+
+            struct sockaddr_in serv_addr;
+            memset(&serv_addr, 0, sizeof(serv_addr));
+            serv_addr.sin_family = AF_INET;
+            serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+            serv_addr.sin_port = htons(plaintext_port);
+
+            do {
+                ret = bind(sockd, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+                if (!ret)
+                    break;
+                LOGWARNING("Connector failed to bind to plaintext socket, retrying in 5s");
+                sleep(5);
+            } while (++tries < 25);
+
+            if (ret < 0) {
+                LOGERR("Connector failed to bind to plaintext socket for 2 minutes");
+                Close(sockd);
+                goto out;
+            }
+
+            if (listen(sockd, 8192) < 0) {
+                LOGERR("Connector failed to listen on plaintext socket");
+                Close(sockd);
+                goto out;
+            }
+
+            cdata->serverfd[listener_index] = sockd;
+            cdata->server_is_tls[listener_index] = false;
+            url_from_socket(sockd, newurl, newport);
+            ASPRINTF(&ckp->serverurl[listener_index], "%s:%s", newurl, newport);
+            LOGNOTICE("Plaintext listener created on %s:%s", newurl, newport);
+            listener_index++;
+            ckp->serverurls++;
+        }
+
+        /* Create TLS listener if enabled */
+        if (ckp->tls_enabled) {
+            int tls_port = ckp->tls_port ? ckp->tls_port : 3443;
+
+            sockd = socket(AF_INET, SOCK_STREAM, 0);
+            if (sockd < 0) {
+                LOGERR("Connector failed to open TLS socket");
+                goto out;
+            }
+            setsockopt(sockd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+
+            struct sockaddr_in serv_addr;
+            memset(&serv_addr, 0, sizeof(serv_addr));
+            serv_addr.sin_family = AF_INET;
+            serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+            serv_addr.sin_port = htons(tls_port);
+
+            do {
+                ret = bind(sockd, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+                if (!ret)
+                    break;
+                LOGWARNING("Connector failed to bind to TLS socket, retrying in 5s");
+                sleep(5);
+            } while (++tries < 25);
+
+            if (ret < 0) {
+                LOGERR("Connector failed to bind to TLS socket for 2 minutes");
+                Close(sockd);
+                goto out;
+            }
+
+            if (listen(sockd, 8192) < 0) {
+                LOGERR("Connector failed to listen on TLS socket");
+                Close(sockd);
+                goto out;
+            }
+
+            cdata->serverfd[listener_index] = sockd;
+            cdata->server_is_tls[listener_index] = true;
+            url_from_socket(sockd, newurl, newport);
+            ASPRINTF(&ckp->serverurl[listener_index], "%s:%s", newurl, newport);
+            LOGNOTICE("TLS listener created on %s:%s", newurl, newport);
+            listener_index++;
+            ckp->serverurls++;
+        }
+    } else {
+        /* Existing serverurls parsing */
+        cdata->serverfd = ckalloc(sizeof(int) * ckp->serverurls);
+        cdata->server_is_tls = ckalloc(sizeof(bool) * ckp->serverurls);
+
+        for (i = 0; i < ckp->serverurls; i++) {
+            char oldurl[INET6_ADDRSTRLEN], oldport[8];
+            char *serverurl = ckp->serverurl[i];
+            int port;
+
+            if (!url_from_serverurl(serverurl, newurl, newport)) {
+                LOGWARNING("Failed to extract resolved url from %s", serverurl);
+                goto out;
+            }
+            port = atoi(newport);
+            /* All high port servers are treated as highdiff ports */
+            if (port > 4000) {
+                LOGNOTICE("Highdiff server %s", serverurl);
+                ckp->server_highdiff[i] = true;
+            }
+            sockd = ckp->oldconnfd[i];
+            if (url_from_socket(sockd, oldurl, oldport)) {
+                if (strcmp(newurl, oldurl) || strcmp(newport, oldport)) {
+                    LOGWARNING("Handed over socket url %s:%s does not match config %s:%s, creating new socket",
+                           oldurl, oldport, newurl, newport);
+                    Close(sockd);
+                }
+            }
+
+            do {
+                if (sockd > 0)
+                    break;
+                sockd = bind_socket(newurl, newport);
+                if (sockd > 0)
+                    break;
+                LOGWARNING("Connector failed to bind to socket, retrying in 5s");
+                sleep(5);
+            } while (++tries < 25);
+
+            if (sockd < 0) {
+                LOGERR("Connector failed to bind to socket for 2 minutes");
+                goto out;
+            }
+            if (listen(sockd, 8192) < 0) {
+                LOGERR("Connector failed to listen on socket");
+                Close(sockd);
+                goto out;
+            }
+            cdata->serverfd[i] = sockd;
+
+            /* Determine if this is a TLS listener based on port number */
+            /* Use TLS for configured TLS port, plaintext for plaintext port */
+            if ((ckp->tls_port && port == ckp->tls_port) ||
+                (!ckp->tls_port && port == 3443)) { // Default TLS port
+                cdata->server_is_tls[i] = true;
+                LOGNOTICE("TLS listener configured on port %d", port);
+            } else if ((ckp->plaintext_port && port == ckp->plaintext_port) ||
+                      (!ckp->plaintext_port && port == 3333)) { // Default plaintext port
+                cdata->server_is_tls[i] = false;
+                LOGNOTICE("Plaintext listener configured on port %d", port);
+            } else {
+                // If port doesn't match configured ports, default based on port number
+                // (this handles backward compatibility)
+                if (port == 3443 || port == 443) {
+                    cdata->server_is_tls[i] = true;
+                    LOGNOTICE("Auto-detected TLS listener on port %d", port);
+                } else {
+                    cdata->server_is_tls[i] = false;
+                    LOGNOTICE("Auto-detected plaintext listener on port %d", port);
+                }
+            }
+        }
+    }
 
 	if (tries)
 		LOGWARNING("Connector successfully bound to socket");
@@ -1693,12 +2190,41 @@ void *connector(void *arg)
 	cdata->start_time = time(NULL);
 
 	ckp->connector_ready = true;
-	LOGWARNING("%s connector ready", ckp->name);
+	LOGWARNING("%s TLS connector ready", ckp->name);
 
 	connector_loop(pi, cdata);
 out:
+	/* Cleanup SSL context */
+	if (cdata->ssl_ctx) {
+		SSL_CTX_free(cdata->ssl_ctx);
+		cdata->ssl_ctx = NULL;
+	}
+
+	/* Free certificate paths */
+	if (cdata->cert_file)
+		free(cdata->cert_file);
+	if (cdata->key_file)
+		free(cdata->key_file);
+	if (cdata->ca_file)
+		free(cdata->ca_file);
+
+	/* Free server file descriptors */
+	if (cdata->serverfd)
+		free(cdata->serverfd);
+	if (cdata->server_is_tls)
+		free(cdata->server_is_tls);
+
+	/* Destroy locks and conditions */
+	cklock_destroy(&cdata->lock);
+	mutex_destroy(&cdata->sender_lock);
+
+	/* Free the data structure itself */
+	free(cdata);
+
 	/* We should never get here unless there's a fatal error */
 	LOGEMERG("Connector failure, shutting down");
 	exit(1);
+
 	return NULL;
 }
+
