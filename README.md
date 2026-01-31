@@ -1,13 +1,13 @@
 # CKPool - Next-Gen Mining Stratum Server
 **High-performance Bitcoin mining stratum server** featuring:
 
-✓ **Dual-Protocol Support:** TLS 1.3 (port 3443) & Plaintext (port 3333)
-✓ **Encryption**: TLS_AES_256_GCM_SHA384 - 256-bit cipher suite
-✓ **Certificate Flexibility** (Self-signed, CA-signed, Let's Encrypt and Client certificate verification)
-✓ **Upgraded Hardware-Accelerated SHA-256** (SHA-NI + OpenSSL EVP)
-✓ **Modern build system** with CMake integration
-✓ **Using latest/stable JSON/Jansson v2.14.1 library**
-✓ **Optimized multi-process architecture for Linux**
+✓ **Dual-Protocol Support:** TLS 1.3 (port 3443) & Plaintext (port 3333)  
+✓ **Encryption**: TLS_AES_256_GCM_SHA384 - 256-bit cipher suite  
+✓ **Certificate Flexibility** (Self-signed, CA-signed, Let's Encrypt and Client certificate verification)  
+✓ **Upgraded Hardware-Accelerated SHA-256** (SHA-NI + OpenSSL EVP)  
+✓ **Modern build system** with CMake integration  
+✓ **Using latest/stable JSON/Jansson v2.14.1 library**  
+✓ **Optimized multi-process architecture for Linux**  
 
 *"The most efficient and Secured CKPool implementation to date"*
 
