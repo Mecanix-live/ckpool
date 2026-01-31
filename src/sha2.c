@@ -62,13 +62,13 @@ const uint32_t sha256_h0[8] = {
     0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
 };
 
-typedef struct {
-    union {
-        sha256_ctx native_ctx;
-        EVP_MD_CTX *evp_ctx;
-    };
-    int use_sha_ni;
-} sha256_runtime_ctx;
+//typedef struct {
+//    union {
+//        sha256_ctx native_ctx;
+//        EVP_MD_CTX *evp_ctx;
+//    };
+//    int use_sha_ni;
+//} sha256_runtime_ctx;
 
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -257,109 +257,99 @@ typedef struct {
 
 
 void sha256_init(sha256_ctx *ctx) {
-
-    sha256_runtime_ctx *sha256_runtime = (sha256_runtime_ctx *)ctx;
-
 #if defined(__x86_64__) || defined(__i386__)
-    if (supports_sha_ni()) {
-        memcpy(&sha256_runtime->native_ctx.h, sha256_h0, sizeof(sha256_h0));
-        sha256_runtime->native_ctx.len = 0;
-        sha256_runtime->native_ctx.tot_len = 0;
-        sha256_runtime->use_sha_ni = 1;
-        return;
-    }
+	if (supports_sha_ni()) {
+		// Use the native part of the union
+		memcpy(&ctx->h, sha256_h0, sizeof(sha256_h0));
+		ctx->len = 0;
+		ctx->tot_len = 0;
+		ctx->use_sha_ni = 1;  // Use the new field
+		return;
+	}
 #endif
-    sha256_runtime->evp_ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(sha256_runtime->evp_ctx, EVP_sha256(), NULL);
-    sha256_runtime->use_sha_ni = 0;
+
+	// Use OpenSSL
+	ctx->evp_ctx = EVP_MD_CTX_new();
+	EVP_DigestInit_ex(ctx->evp_ctx, EVP_sha256(), NULL);
+	ctx->use_sha_ni = 0;  // Use the new field
 }
 
 void sha256_update(sha256_ctx *ctx, const unsigned char *message, unsigned int len) {
-    sha256_runtime_ctx *sha256_runtime = (sha256_runtime_ctx *)ctx;
-
-    if (sha256_runtime->use_sha_ni) {
+	if (ctx->use_sha_ni) {  // Use the new field
 #if defined(__x86_64__) || defined(__i386__)
+		// SHA-NI implementation
+		unsigned int block_nb;
+		unsigned int new_len, rem_len, tmp_len;
+		const unsigned char *shifted_message;
 
-        // SHA-NI
-        unsigned int block_nb;
-        unsigned int new_len, rem_len, tmp_len;
-        const unsigned char *shifted_message;
+		tmp_len = 64 - ctx->len;
+		rem_len = len < tmp_len ? len : tmp_len;
 
-        tmp_len = 64 - sha256_runtime->native_ctx.len;
-        rem_len = len < tmp_len ? len : tmp_len;
+		memcpy(&ctx->block[ctx->len], message, rem_len);
 
-        memcpy(&sha256_runtime->native_ctx.block[sha256_runtime->native_ctx.len], message, rem_len);
+		if (ctx->len + len < 64) {
+			ctx->len += len;
+			return;
+		}
 
-        if (sha256_runtime->native_ctx.len + len < 64) {
-            sha256_runtime->native_ctx.len += len;
-            return;
-        }
+		new_len = len - rem_len;
+		block_nb = new_len / 64;
+		shifted_message = message + rem_len;
 
-        new_len = len - rem_len;
-        block_nb = new_len / 64;
-        shifted_message = message + rem_len;
+		sha256_transf(ctx, ctx->block, 1);
+		sha256_transf(ctx, shifted_message, block_nb);
 
-        sha256_transf(&sha256_runtime->native_ctx, sha256_runtime->native_ctx.block, 1);
-        sha256_transf(&sha256_runtime->native_ctx, shifted_message, block_nb);
+		rem_len = new_len % 64;
+		memcpy(ctx->block, &shifted_message[block_nb * 64], rem_len);
 
-        rem_len = new_len % 64;
-        memcpy(sha256_runtime->native_ctx.block, &shifted_message[block_nb * 64], rem_len);
-
-        sha256_runtime->native_ctx.len = rem_len;
-        sha256_runtime->native_ctx.tot_len += (block_nb + 1) * 64;
-
+		ctx->len = rem_len;
+		ctx->tot_len += (block_nb + 1) * 64;
 #endif
-    } else {
-        // OpenSSL
-        EVP_DigestUpdate(sha256_runtime->evp_ctx, message, len);
-    }
+	} else {
+		// OpenSSL implementation
+		EVP_DigestUpdate(ctx->evp_ctx, message, len);
+	}
 }
 
 void sha256_final(sha256_ctx *ctx, unsigned char *digest) {
-
-    sha256_runtime_ctx *sha256_runtime = (sha256_runtime_ctx *)ctx;
-
-    if (sha256_runtime->use_sha_ni) {
-
+	if (ctx->use_sha_ni) {  // Use the new field
 #if defined(__x86_64__) || defined(__i386__)
+		// SHA-NI finalization
+		unsigned int block_nb;
+		unsigned int pm_len;
+		uint64_t len_bits;
 
-        // SHA-NI
-        unsigned int block_nb;
-        unsigned int pm_len;
-        uint64_t len_bits;
+		block_nb = (1 + ((64 - 9) < (ctx->len % 64)));
+		pm_len = block_nb * 64;
 
-        block_nb = (1 + ((64 - 9) < (sha256_runtime->native_ctx.len % 64)));
-        pm_len = block_nb * 64;
+		memset(ctx->block + ctx->len, 0, pm_len - ctx->len);
+		ctx->block[ctx->len] = 0x80;
 
-        memset(sha256_runtime->native_ctx.block + sha256_runtime->native_ctx.len, 0, pm_len - sha256_runtime->native_ctx.len);
-        sha256_runtime->native_ctx.block[sha256_runtime->native_ctx.len] = 0x80;
+		len_bits = ((uint64_t)ctx->tot_len + ctx->len) * 8;
+		for (int i = 0; i < 8; i++) {
+			ctx->block[pm_len - 8 + i] = (len_bits >> (56 - i*8)) & 0xff;
+		}
 
-        len_bits = ((uint64_t)sha256_runtime->native_ctx.tot_len + sha256_runtime->native_ctx.len) * 8;
-        for (int i = 0; i < 8; i++) {
-            sha256_runtime->native_ctx.block[pm_len - 8 + i] = (len_bits >> (56 - i*8)) & 0xff;
-        }
+		sha256_transf(ctx, ctx->block, block_nb);
 
-        sha256_transf(&sha256_runtime->native_ctx, sha256_runtime->native_ctx.block, block_nb);
-
-        for (int i = 0; i < 8; i++) {
-            digest[i*4+0] = (sha256_runtime->native_ctx.h[i] >> 24) & 0xff;
-            digest[i*4+1] = (sha256_runtime->native_ctx.h[i] >> 16) & 0xff;
-            digest[i*4+2] = (sha256_runtime->native_ctx.h[i] >> 8) & 0xff;
-            digest[i*4+3] = sha256_runtime->native_ctx.h[i] & 0xff;
-        }
+		for (int i = 0; i < 8; i++) {
+			digest[i*4+0] = (ctx->h[i] >> 24) & 0xff;
+			digest[i*4+1] = (ctx->h[i] >> 16) & 0xff;
+			digest[i*4+2] = (ctx->h[i] >> 8) & 0xff;
+			digest[i*4+3] = ctx->h[i] & 0xff;
+		}
 #endif
-
-    } else {
-        // OpenSSL
-        unsigned int digest_len;
-        EVP_DigestFinal_ex(sha256_runtime->evp_ctx, digest, &digest_len);
-        EVP_MD_CTX_free(sha256_runtime->evp_ctx);
-    }
+	} else {
+		// OpenSSL finalization
+		unsigned int digest_len;
+		EVP_DigestFinal_ex(ctx->evp_ctx, digest, &digest_len);
+		EVP_MD_CTX_free(ctx->evp_ctx);
+	}
 }
 
 void sha256(const unsigned char *message, unsigned int len, unsigned char *digest) {
-    sha256_ctx ctx;
-    sha256_init(&ctx);
-    sha256_update(&ctx, message, len);
-    sha256_final(&ctx, digest);
+	sha256_ctx ctx;
+	sha256_init(&ctx);
+	sha256_update(&ctx, message, len);
+	sha256_final(&ctx, digest);
 }

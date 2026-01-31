@@ -32,6 +32,7 @@ typedef struct {
 			uint32_t h[8];
 		};
 	};
+	int use_sha_ni; // 1 = use SHA-NI, 0 = use OpenSSL
 } sha256_ctx;
 
 extern const uint32_t sha256_k[64];
